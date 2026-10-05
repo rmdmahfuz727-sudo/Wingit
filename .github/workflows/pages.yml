@@ -1,0 +1,731 @@
+name: Deploy web app
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Create the web app
+        run: |
+          mkdir -p _site
+          cat > _site/index.html <<'WINGIT_EOF'
+          <!doctype html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+          <meta name="theme-color" content="#1d1740">
+          <meta name="mobile-web-app-capable" content="yes">
+          <meta name="apple-mobile-web-app-capable" content="yes">
+          <meta name="apple-mobile-web-app-title" content="Wingit">
+          <link rel="manifest" href="manifest.webmanifest">
+          <link rel="icon" href="icon-192.png" type="image/png">
+          <link rel="apple-touch-icon" href="icon-192.png">
+          <title>Wingit</title>
+          <link rel="preconnect" href="https://fonts.googleapis.com">
+          <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+          <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bagel+Fat+One&family=DM+Mono:wght@500&display=swap">
+          <style>
+          /* Layout: slim top bar, one tall dusk-lit playfield scaled to fit the screen, a hint line beneath.
+             Single look by choice: a game that lives at dusk, so it keeps its own palette in any theme. */
+          :root {
+            --night: #1d1740;
+            --dusk: #3b2a6b;
+            --glow: #ff9a6b;
+            --copper: #c8693a;
+            --brass: #f1c05a;
+            --cream: #fff1dc;
+            --coral: #ff6b5e;
+            --font-display: "Bagel Fat One", "Arial Rounded MT Bold", Impact, sans-serif;
+            --font-mono: "DM Mono", ui-monospace, Menlo, Consolas, monospace;
+            color-scheme: dark;
+          }
+          html, body { height: 100%; overscroll-behavior: none; }
+          body {
+            box-sizing: border-box;
+            margin: 0;
+            padding-inline: 16px;
+            padding-top: max(12px, env(safe-area-inset-top));
+            padding-bottom: max(12px, env(safe-area-inset-bottom));
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            background: var(--night);
+            color: var(--cream);
+            font-family: var(--font-mono);
+            overflow: hidden;
+          }
+          .bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+          .mark { margin: 0; font: 400 28px/1 var(--font-display); color: var(--coral); letter-spacing: 0.02em; }
+          .snd {
+            font: 500 12px/1 var(--font-mono);
+            color: var(--cream);
+            background: transparent;
+            border: 1px solid rgba(255, 241, 220, 0.35);
+            border-radius: 999px;
+            padding: 11px 16px;
+            cursor: pointer;
+          }
+          .snd:hover { border-color: var(--brass); }
+          .snd:focus-visible { outline: 2px solid var(--brass); outline-offset: 2px; }
+          .stage {
+            flex: 1;
+            min-height: 0;
+            min-width: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            touch-action: none;
+            user-select: none;
+            -webkit-user-select: none;
+            -webkit-tap-highlight-color: transparent;
+          }
+          canvas {
+            display: block;
+            max-width: 100%;
+            border-radius: 14px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.45);
+            cursor: pointer;
+          }
+          .hint { margin: 0; text-align: center; font-size: 12px; line-height: 1.4; color: rgba(255, 241, 220, 0.72); }
+          .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+          </style>
+          </head>
+          <body>
+
+          <header class="bar">
+            <h1 class="mark">Wingit</h1>
+            <button id="snd" class="snd" type="button" aria-pressed="true">Sound on</button>
+          </header>
+          <main id="stage" class="stage">
+            <canvas id="game" width="360" height="560" role="img" aria-label="Wingit playfield. Tap, click or press space to flap."></canvas>
+          </main>
+          <p class="hint">Space, ↑ or tap to flap. Fly through the gaps in the copper pipes.</p>
+          <div id="live" class="sr" aria-live="polite"></div>
+
+          <script>
+          (() => {
+            const W = 360, H = 560, GROUND = 76, FLOOR = H - GROUND;
+            const GRAV = 0.36, FLAP = -6.4, MAXFALL = 8.5, SPEED = 2.3;
+            const GAP = 150, PW = 58, CAPH = 22, SPACING = 200;
+            const BX = 96, BR = 12, HR = 10;
+
+            const canvas = document.getElementById('game');
+            const ctx = canvas.getContext('2d');
+            const stage = document.getElementById('stage');
+            const sndBtn = document.getElementById('snd');
+            const live = document.getElementById('live');
+            const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+            const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+            const mod = (a, m) => ((a % m) + m) % m;
+
+            // ---------- state ----------
+            let view = 1;
+            let state = 'ready';
+            let bird, pipes, score, scroll, frames = 0, shake = 0, flapAnim = 0;
+            let deadAt = 0, newBest = false, onGround = false;
+            let best = 0;
+            try { best = parseInt(localStorage.getItem('wingit-best') || '0', 10) || 0; } catch (e) {}
+
+            // stars (deterministic)
+            const stars = [];
+            let seed = 7;
+            const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+            for (let i = 0; i < 46; i++) stars.push({ x: rnd() * W, y: rnd() * (FLOOR * 0.5), r: 0.6 + rnd() * 1.1, p: rnd() * 6 });
+            const clouds = [{ x: 30, y: 110, s: 1 }, { x: 190, y: 190, s: 0.7 }, { x: 320, y: 70, s: 0.85 }, { x: 460, y: 150, s: 1.1 }];
+
+            function reset() {
+              bird = { y: H * 0.42, vy: 0, rot: 0, t: 0 };
+              pipes = [];
+              score = 0;
+              scroll = scroll || 0;
+              shake = 0;
+              flapAnim = 0;
+              onGround = false;
+              newBest = false;
+            }
+
+            function spawnPipe(x) {
+              const prev = pipes.length ? pipes[pipes.length - 1].gapY : FLOOR / 2;
+              const lo = Math.max(GAP / 2 + 60, prev - 150);
+              const hi = Math.min(FLOOR - 60 - GAP / 2, prev + 150);
+              pipes.push({ x, gapY: lo + Math.random() * (hi - lo), passed: false });
+            }
+
+            function start() {
+              state = 'playing';
+              pipes = [];
+              spawnPipe(W + 80);
+              live.textContent = 'Go';
+            }
+
+            function flap() {
+              bird.vy = FLAP;
+              flapAnim = 12;
+              sfx.flap();
+            }
+
+            function die() {
+              if (state === 'dead') return;
+              state = 'dead';
+              deadAt = performance.now();
+              bird.vy = Math.min(bird.vy, -2.5);
+              if (!reduced) shake = 9;
+              if (score > best) {
+                best = score;
+                newBest = true;
+                try { localStorage.setItem('wingit-best', String(best)); } catch (e) {}
+              }
+              sfx.hit();
+              live.textContent = 'Game over. Score ' + score + '. Best ' + best + '.';
+            }
+
+            function action() {
+              audioInit();
+              if (state === 'ready') { start(); flap(); }
+              else if (state === 'playing') flap();
+              else if (performance.now() - deadAt > 650) { reset(); start(); flap(); }
+            }
+
+            // ---------- sound ----------
+            let ac = null, muted = false;
+            function audioInit() {
+              if (muted) return;
+              if (!ac) {
+                try { ac = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { ac = null; }
+              }
+              if (ac && ac.state === 'suspended') ac.resume();
+            }
+            function tone(f1, f2, dur, type, vol, delay) {
+              if (!ac || muted) return;
+              const t = ac.currentTime + (delay || 0);
+              const o = ac.createOscillator(), g = ac.createGain();
+              o.type = type;
+              o.frequency.setValueAtTime(f1, t);
+              o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+              g.gain.setValueAtTime(vol, t);
+              g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+              o.connect(g);
+              g.connect(ac.destination);
+              o.start(t);
+              o.stop(t + dur + 0.02);
+            }
+            const sfx = {
+              flap() { tone(380, 640, 0.09, 'triangle', 0.09); },
+              point() { tone(660, 660, 0.06, 'square', 0.04); tone(990, 990, 0.1, 'square', 0.04, 0.06); },
+              hit() { tone(240, 50, 0.28, 'sawtooth', 0.09); }
+            };
+            sndBtn.addEventListener('click', () => {
+              muted = !muted;
+              sndBtn.textContent = muted ? 'Sound off' : 'Sound on';
+              sndBtn.setAttribute('aria-pressed', String(!muted));
+              if (!muted) audioInit();
+              sndBtn.blur();
+            });
+
+            // ---------- input ----------
+            stage.addEventListener('pointerdown', (e) => {
+              if (e.target === sndBtn) return;
+              e.preventDefault();
+              action();
+            });
+            window.addEventListener('keydown', (e) => {
+              if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
+                if (e.target && e.target.tagName === 'BUTTON') return;
+                e.preventDefault();
+                if (!e.repeat) action();
+              }
+            });
+
+            // ---------- sizing ----------
+            function fit() {
+              const aw = stage.clientWidth, ah = stage.clientHeight;
+              const s = Math.max(0.2, Math.min(aw / W, ah / H));
+              const cw = Math.floor(W * s), ch = Math.floor(H * s);
+              const dpr = Math.min(window.devicePixelRatio || 1, 3);
+              canvas.style.width = cw + 'px';
+              canvas.style.height = ch + 'px';
+              canvas.width = Math.round(cw * dpr);
+              canvas.height = Math.round(ch * dpr);
+              view = canvas.width / W;
+            }
+            if (window.ResizeObserver) new ResizeObserver(fit).observe(stage);
+            window.addEventListener('resize', fit);
+
+            // ---------- simulation ----------
+            function hitRect(rx, ry, rw, rh) {
+              const cx = clamp(BX, rx, rx + rw), cy = clamp(bird.y, ry, ry + rh);
+              const dx = BX - cx, dy = bird.y - cy;
+              return dx * dx + dy * dy < HR * HR;
+            }
+
+            function step() {
+              frames++;
+              if (flapAnim > 0) flapAnim--;
+              shake *= 0.84;
+              if (state !== 'dead') scroll += SPEED;
+              bird.t++;
+
+              if (state === 'ready') {
+                bird.y = H * 0.42 + Math.sin(bird.t * 0.08) * 8;
+                bird.rot = 0;
+                return;
+              }
+
+              if (state === 'dead') {
+                if (!onGround) {
+                  bird.vy = Math.min(bird.vy + GRAV, MAXFALL);
+                  bird.y += bird.vy;
+                  bird.rot = Math.min(bird.rot + 0.12, 1.5);
+                  if (bird.y >= FLOOR - BR) { bird.y = FLOOR - BR; onGround = true; }
+                }
+                return;
+              }
+
+              bird.vy = Math.min(bird.vy + GRAV, MAXFALL);
+              bird.y += bird.vy;
+              bird.rot = clamp(bird.vy * 0.07, -0.45, 1.2);
+              if (bird.y - BR < 0) { bird.y = BR; bird.vy = 0; }
+
+              for (const p of pipes) p.x -= SPEED;
+              if (pipes.length && pipes[0].x < -PW - 12) pipes.shift();
+              const last = pipes[pipes.length - 1];
+              if (!last || last.x < W + PW - SPACING) spawnPipe(W + PW);
+
+              for (const p of pipes) {
+                if (!p.passed && p.x + PW < BX) {
+                  p.passed = true;
+                  score++;
+                  sfx.point();
+                  live.textContent = String(score);
+                }
+                if (BX + HR > p.x - 4 && BX - HR < p.x + PW + 4) {
+                  const gt = p.gapY - GAP / 2, gb = p.gapY + GAP / 2;
+                  if (hitRect(p.x, -60, PW, gt - CAPH + 60) || hitRect(p.x - 4, gt - CAPH, PW + 8, CAPH) ||
+                      hitRect(p.x - 4, gb, PW + 8, CAPH) || hitRect(p.x, gb + CAPH, PW, FLOOR - gb - CAPH)) {
+                    die();
+                    return;
+                  }
+                }
+              }
+              if (bird.y + BR >= FLOOR) {
+                bird.y = FLOOR - BR;
+                onGround = true;
+                die();
+              }
+            }
+
+            // ---------- drawing ----------
+            function rr(x, y, w, h, r) {
+              ctx.beginPath();
+              if (ctx.roundRect) ctx.roundRect(x, y, w, h, r); else ctx.rect(x, y, w, h);
+            }
+
+            function label(str, x, y, size, fill, o) {
+              o = o || {};
+              ctx.font = o.mono ? '500 ' + size + 'px "DM Mono", ui-monospace, monospace'
+                                : size + 'px "Bagel Fat One", "Arial Rounded MT Bold", Impact, sans-serif';
+              ctx.textAlign = o.align || 'center';
+              ctx.textBaseline = 'alphabetic';
+              ctx.lineJoin = 'round';
+              if (o.stroke) { ctx.lineWidth = o.sw || 6; ctx.strokeStyle = o.stroke; ctx.strokeText(str, x, y); }
+              ctx.fillStyle = fill;
+              ctx.fillText(str, x, y);
+            }
+
+            function hills(off, base, amp, f1, f2, color) {
+              ctx.fillStyle = color;
+              ctx.beginPath();
+              ctx.moveTo(0, FLOOR);
+              for (let x = 0; x <= W; x += 6) {
+                const u = x + off;
+                ctx.lineTo(x, base - amp * (Math.sin(u * f1) + 0.55 * Math.sin(u * f2 + 1.3)));
+              }
+              ctx.lineTo(W, FLOOR);
+              ctx.closePath();
+              ctx.fill();
+            }
+
+            function star(cx, cy, r, ri) {
+              ctx.beginPath();
+              for (let i = 0; i < 10; i++) {
+                const a = -Math.PI / 2 + i * Math.PI / 5, rad = i % 2 ? ri : r;
+                const x = cx + Math.cos(a) * rad, y = cy + Math.sin(a) * rad;
+                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+              }
+              ctx.closePath();
+            }
+
+            function drawBackdrop() {
+              const sky = ctx.createLinearGradient(0, 0, 0, FLOOR);
+              sky.addColorStop(0, '#1d1740');
+              sky.addColorStop(0.5, '#43296f');
+              sky.addColorStop(0.8, '#b8517a');
+              sky.addColorStop(1, '#ff9a6b');
+              ctx.fillStyle = sky;
+              ctx.fillRect(0, 0, W, H);
+
+              for (const s of stars) {
+                ctx.globalAlpha = 0.35 + 0.35 * Math.sin(frames * 0.03 + s.p);
+                ctx.fillStyle = '#fff1dc';
+                ctx.beginPath();
+                ctx.arc(s.x, s.y, s.r, 0, 6.2832);
+                ctx.fill();
+              }
+              ctx.globalAlpha = 1;
+
+              const glow = ctx.createRadialGradient(250, FLOOR - 62, 8, 250, FLOOR - 62, 140);
+              glow.addColorStop(0, 'rgba(255,176,116,0.6)');
+              glow.addColorStop(1, 'rgba(255,176,116,0)');
+              ctx.fillStyle = glow;
+              ctx.fillRect(0, 0, W, FLOOR);
+              ctx.fillStyle = '#ffd39a';
+              ctx.beginPath();
+              ctx.arc(250, FLOOR - 62, 38, 0, 6.2832);
+              ctx.fill();
+
+              for (const c of clouds) {
+                const cx = mod(c.x - scroll * 0.12, W + 220) - 110;
+                ctx.fillStyle = 'rgba(255,190,170,0.2)';
+                ctx.beginPath();
+                ctx.ellipse(cx, c.y, 34 * c.s, 11 * c.s, 0, 0, 6.2832);
+                ctx.ellipse(cx + 22 * c.s, c.y - 8 * c.s, 24 * c.s, 12 * c.s, 0, 0, 6.2832);
+                ctx.ellipse(cx - 22 * c.s, c.y - 4 * c.s, 20 * c.s, 9 * c.s, 0, 0, 6.2832);
+                ctx.fill();
+              }
+
+              hills(scroll * 0.15, FLOOR - 40, 22, 0.011, 0.027, '#4a2d73');
+              hills(scroll * 0.35 + 90, FLOOR - 14, 16, 0.019, 0.041, '#2d2058');
+            }
+
+            function drawPipe(p) {
+              const gt = p.gapY - GAP / 2, gb = p.gapY + GAP / 2;
+              const body = ctx.createLinearGradient(p.x, 0, p.x + PW, 0);
+              body.addColorStop(0, '#8a3b20');
+              body.addColorStop(0.28, '#e58e56');
+              body.addColorStop(0.6, '#c8693a');
+              body.addColorStop(1, '#78321a');
+              const cap = ctx.createLinearGradient(p.x - 4, 0, p.x + PW + 4, 0);
+              cap.addColorStop(0, '#9a6f1f');
+              cap.addColorStop(0.3, '#f8d98a');
+              cap.addColorStop(0.65, '#dca640');
+              cap.addColorStop(1, '#8c6419');
+              ctx.strokeStyle = 'rgba(24,10,34,0.6)';
+              ctx.lineWidth = 2;
+
+              ctx.fillStyle = body;
+              ctx.fillRect(p.x, -10, PW, gt - CAPH + 10);
+              ctx.strokeRect(p.x, -10, PW, gt - CAPH + 10);
+              ctx.fillRect(p.x, gb + CAPH, PW, FLOOR - gb - CAPH);
+              ctx.strokeRect(p.x, gb + CAPH, PW, FLOOR - gb - CAPH);
+              ctx.fillStyle = 'rgba(255,255,255,0.16)';
+              ctx.fillRect(p.x + 9, -10, 4, gt - CAPH + 10);
+              ctx.fillRect(p.x + 9, gb + CAPH, 4, FLOOR - gb - CAPH);
+
+              ctx.fillStyle = cap;
+              rr(p.x - 4, gt - CAPH, PW + 8, CAPH, 5); ctx.fill(); ctx.stroke();
+              rr(p.x - 4, gb, PW + 8, CAPH, 5); ctx.fill(); ctx.stroke();
+              ctx.fillStyle = 'rgba(80,45,10,0.55)';
+              for (const rx of [p.x + 3, p.x + PW - 3]) {
+                ctx.beginPath(); ctx.arc(rx, gt - CAPH / 2, 1.8, 0, 6.2832); ctx.fill();
+                ctx.beginPath(); ctx.arc(rx, gb + CAPH / 2, 1.8, 0, 6.2832); ctx.fill();
+              }
+            }
+
+            function drawGround() {
+              ctx.fillStyle = '#2a1a3d';
+              ctx.fillRect(0, FLOOR, W, GROUND);
+              ctx.fillStyle = '#e9a35a';
+              ctx.fillRect(0, FLOOR, W, 8);
+              ctx.fillStyle = '#c47f3c';
+              ctx.fillRect(0, FLOOR + 8, W, 3);
+              ctx.fillStyle = '#35224d';
+              const off = mod(scroll, 40);
+              for (let x = -40 - off; x < W + 40; x += 40) {
+                ctx.beginPath();
+                ctx.moveTo(x, FLOOR + 11);
+                ctx.lineTo(x + 20, FLOOR + 11);
+                ctx.lineTo(x + 4, H);
+                ctx.lineTo(x - 16, H);
+                ctx.closePath();
+                ctx.fill();
+              }
+            }
+
+            function drawBird() {
+              ctx.save();
+              ctx.translate(BX, bird.y);
+              ctx.rotate(bird.rot);
+              ctx.lineWidth = 2;
+              ctx.strokeStyle = 'rgba(24,10,34,0.65)';
+
+              ctx.fillStyle = '#d94a42';
+              ctx.beginPath();
+              ctx.moveTo(-12, -1); ctx.lineTo(-24, -7); ctx.lineTo(-22, 3); ctx.lineTo(-24, 9); ctx.lineTo(-11, 5);
+              ctx.closePath(); ctx.fill(); ctx.stroke();
+
+              ctx.fillStyle = '#d94a42';
+              ctx.beginPath();
+              ctx.moveTo(-3, -11); ctx.lineTo(-1, -19); ctx.lineTo(3, -12); ctx.lineTo(7, -18); ctx.lineTo(8, -10);
+              ctx.closePath(); ctx.fill(); ctx.stroke();
+
+              ctx.fillStyle = '#ff6b5e';
+              ctx.beginPath(); ctx.ellipse(0, 0, 16, 13, 0, 0, 6.2832); ctx.fill(); ctx.stroke();
+              ctx.fillStyle = '#fff1dc';
+              ctx.beginPath(); ctx.ellipse(3, 5, 10, 6.5, 0.1, 0, 6.2832); ctx.fill();
+
+              let wing;
+              if (state === 'ready') wing = Math.sin(bird.t * 0.22) * 0.7;
+              else if (flapAnim > 0) wing = -0.9 + 1.4 * (1 - flapAnim / 12);
+              else wing = 0.35;
+              ctx.save();
+              ctx.translate(-4, 1);
+              ctx.rotate(wing);
+              ctx.fillStyle = '#ffb347';
+              ctx.beginPath(); ctx.ellipse(-4, 0, 10, 5.5, 0, 0, 6.2832); ctx.fill(); ctx.stroke();
+              ctx.restore();
+
+              ctx.fillStyle = '#ffb347';
+              ctx.beginPath(); ctx.moveTo(13, -3); ctx.lineTo(23, 1); ctx.lineTo(13, 5); ctx.closePath(); ctx.fill(); ctx.stroke();
+
+              if (state === 'dead') {
+                ctx.strokeStyle = '#1d1740'; ctx.lineWidth = 2; ctx.lineCap = 'round';
+                ctx.beginPath(); ctx.moveTo(4, -8); ctx.lineTo(11, -1); ctx.moveTo(11, -8); ctx.lineTo(4, -1); ctx.stroke();
+              } else {
+                ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(7, -4, 4.4, 0, 6.2832); ctx.fill(); ctx.stroke();
+                ctx.fillStyle = '#1d1740'; ctx.beginPath(); ctx.arc(8.4, -4, 2.1, 0, 6.2832); ctx.fill();
+              }
+              ctx.restore();
+            }
+
+            function drawReady(now) {
+              label('WINGIT', W / 2, 124, 60, '#ff6b5e', { stroke: '#1d1740', sw: 10 });
+              label("Tap to flap. Don't touch the pipes.", W / 2, 158, 13, '#fff1dc', { mono: true });
+              const pulse = 0.65 + 0.35 * Math.sin(now * 0.005);
+              ctx.globalAlpha = pulse;
+              label('TAP TO START', W / 2, 345, 22, '#f1c05a', { stroke: '#1d1740', sw: 6 });
+              ctx.globalAlpha = 1;
+              if (best > 0) label('Best ' + best, W / 2, 375, 13, '#fff1dc', { mono: true });
+            }
+
+            function drawDead(now) {
+              const since = now - deadAt;
+              const f = Math.max(0, 1 - since / 180);
+              if (f > 0) { ctx.fillStyle = 'rgba(255,255,255,' + (f * 0.7) + ')'; ctx.fillRect(0, 0, W, H); }
+              const a = clamp((since - 350) / 250, 0, 1);
+              if (a <= 0) return;
+              ctx.save();
+              ctx.globalAlpha = a;
+              ctx.translate(0, (1 - a) * 18);
+              rr(60, 160, 240, 230, 16);
+              ctx.fillStyle = 'rgba(29,23,64,0.94)'; ctx.fill();
+              ctx.lineWidth = 3; ctx.strokeStyle = '#f1c05a'; ctx.stroke();
+              label('GAME OVER', W / 2, 206, 30, '#ff6b5e');
+
+              const medals = [[40, '#8fe3e0'], [30, '#ffcf4a'], [20, '#cfd6e6'], [10, '#cd7f32']];
+              let col = null;
+              for (const m of medals) if (score >= m[0]) { col = m[1]; break; }
+              ctx.beginPath(); ctx.arc(112, 292, 30, 0, 6.2832);
+              if (col) {
+                ctx.fillStyle = col; ctx.fill();
+                ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(24,10,34,0.55)'; ctx.stroke();
+                star(112, 292, 17, 7); ctx.fillStyle = 'rgba(255,255,255,0.75)'; ctx.fill();
+              } else {
+                ctx.setLineDash([4, 5]); ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(255,241,220,0.4)'; ctx.stroke(); ctx.setLineDash([]);
+                label('10', 112, 298, 18, 'rgba(255,241,220,0.4)');
+              }
+
+              label('SCORE', 164, 258, 11, 'rgba(255,241,220,0.7)', { mono: true, align: 'left' });
+              label(String(score), 164, 294, 36, '#fff1dc', { align: 'left' });
+              label('BEST', 164, 322, 11, 'rgba(255,241,220,0.7)', { mono: true, align: 'left' });
+              label(String(best), 164, 352, 28, '#f1c05a', { align: 'left' });
+              if (newBest) label('NEW BEST', 112, 346, 11, '#f1c05a', { mono: true });
+              ctx.restore();
+
+              if (since > 650) {
+                ctx.globalAlpha = 0.65 + 0.35 * Math.sin(now * 0.006);
+                label('TAP TO RETRY', W / 2, 432, 22, '#f1c05a', { stroke: '#1d1740', sw: 6 });
+                ctx.globalAlpha = 1;
+              }
+            }
+
+            function draw(now) {
+              ctx.setTransform(view, 0, 0, view, 0, 0);
+              ctx.save();
+              if (shake > 0.3) ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+              drawBackdrop();
+              for (const p of pipes) drawPipe(p);
+              drawGround();
+              drawBird();
+              ctx.restore();
+              ctx.setTransform(view, 0, 0, view, 0, 0);
+              if (state === 'playing' || state === 'dead') {
+                label(String(score), W / 2, 74, 56, '#fff1dc', { stroke: '#1d1740', sw: 8 });
+              }
+              if (state === 'ready') drawReady(now);
+              if (state === 'dead') drawDead(now);
+            }
+
+            // ---------- loop ----------
+            let last = 0, acc = 0;
+            const DT = 1000 / 60;
+            function frame(t) {
+              if (!last) last = t;
+              acc += Math.min(t - last, 100);
+              last = t;
+              while (acc >= DT) { step(); acc -= DT; }
+              draw(performance.now());
+              requestAnimationFrame(frame);
+            }
+
+            scroll = 0;
+            reset();
+            fit();
+            requestAnimationFrame(frame);
+          })();
+          </script>
+
+          <script>
+          if ('serviceWorker' in navigator) {
+            window.addEventListener('load', function () {
+              navigator.serviceWorker.register('sw.js').catch(function () {});
+            });
+          }
+          </script>
+          </body>
+          </html>
+          WINGIT_EOF
+          cat > _site/sw.js <<'WINGIT_EOF'
+          const CACHE = 'wingit-v1';
+          const CORE = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './icon-maskable-512.png'];
+
+          self.addEventListener('install', (e) => {
+            e.waitUntil(caches.open(CACHE).then((c) => c.addAll(CORE)).then(() => self.skipWaiting()));
+          });
+
+          self.addEventListener('activate', (e) => {
+            e.waitUntil(
+              caches.keys()
+                .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
+                .then(() => self.clients.claim())
+            );
+          });
+
+          // Cache first so the game opens instantly and offline; refresh the copy in the background.
+          self.addEventListener('fetch', (e) => {
+            const req = e.request;
+            if (req.method !== 'GET') return;
+            const key = req.mode === 'navigate' ? './index.html' : req;
+            e.respondWith(
+              caches.open(CACHE).then(async (cache) => {
+                const hit = await cache.match(key);
+                const net = fetch(req)
+                  .then((res) => {
+                    if (res && (res.ok || res.type === 'opaque')) cache.put(key, res.clone());
+                    return res;
+                  })
+                  .catch(() => null);
+                if (hit) return hit;
+                const res = await net;
+                return res || Response.error();
+              })
+            );
+          });
+          WINGIT_EOF
+          cat > _site/manifest.webmanifest <<'WINGIT_EOF'
+          {
+            "id": "./",
+            "name": "Wingit",
+            "short_name": "Wingit",
+            "description": "Fly a little coral bird through gaps in copper pipes.",
+            "start_url": "./",
+            "scope": "./",
+            "display": "standalone",
+            "orientation": "portrait",
+            "background_color": "#1d1740",
+            "theme_color": "#1d1740",
+            "icons": [
+              {
+                "src": "icon-192.png",
+                "sizes": "192x192",
+                "type": "image/png",
+                "purpose": "any"
+              },
+              {
+                "src": "icon-512.png",
+                "sizes": "512x512",
+                "type": "image/png",
+                "purpose": "any"
+              },
+              {
+                "src": "icon-maskable-512.png",
+                "sizes": "512x512",
+                "type": "image/png",
+                "purpose": "maskable"
+              }
+            ]
+          }
+          WINGIT_EOF
+          base64 -d > _site/icon-192.png <<'WINGIT_EOF'
+          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
+          WINGIT_EOF
+          base64 -d > _site/icon-512.png <<'WINGIT_EOF'
+          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
+          WINGIT_EOF
+          base64 -d > _site/icon-maskable-512.png <<'WINGIT_EOF'
+          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PgsgFZBnNlXKgWkSqPBl+o6d/oAAgw40og4U7YxfbtJA/YD82cK0VRECOFUHalEIVCVQs0S5ohd7+7X6gbxs96rxP/2vEKB1oFHnOEkLijztPgPo/SGjL1T254sjR34hwBQHVK7ysq4qKYJQoUN+Jb+rikV74lf9JW/MtwjQWaBqweWqwo3uW039Rdl/nwB3C1oVOu7f+7q34/sEGFLhi9+EbxYAEAAQAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAARAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAAQABAAEAABAAEAAQABAAEAAQAB4Hv4H/C+op8KvTxEAAAAAElFTkSuQmCC
+          WINGIT_EOF
+          python3 - <<'WINGIT_PY'
+          import re, base64, urllib.request
+          UA = 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36'
+          def get(u):
+              return urllib.request.urlopen(urllib.request.Request(u, headers={'User-Agent': UA}), timeout=30).read()
+          try:
+              css = get('https://fonts.googleapis.com/css2?family=Bagel+Fat+One&family=DM+Mono:wght@500&display=swap').decode()
+              out = []
+              for name, block in re.findall(r'/\* ([a-z0-9-]+) \*/\s*(@font-face\s*\{.*?\})', css, re.S):
+                  if name != 'latin':
+                      continue
+                  m = re.search(r'url\((https://[^)]+)\)', block)
+                  data = base64.b64encode(get(m.group(1))).decode()
+                  out.append(block.replace(m.group(0), 'url(data:font/woff2;base64,' + data + ')'))
+              assert len(out) == 2, len(out)
+              p = open('_site/index.html', encoding='utf-8').read()
+              p = re.sub(r'<link rel="preconnect"[^>]*>\s*', '', p)
+              style = '<style>' + chr(10).join(out) + '</style>'
+              p = re.sub(r'<link rel="stylesheet" href="https://fonts.googleapis.com[^>]*>', lambda m: style, p)
+              open('_site/index.html', 'w', encoding='utf-8').write(p)
+              print('fonts embedded')
+          except Exception as e:
+              print('font embedding skipped:', e)
+          WINGIT_PY
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
